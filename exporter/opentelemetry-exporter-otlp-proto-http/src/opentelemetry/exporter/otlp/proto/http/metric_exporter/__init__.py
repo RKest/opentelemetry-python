@@ -99,6 +99,10 @@ from opentelemetry.util.re import parse_env_headers
 
 _logger = logging.getLogger(__name__)
 
+# VAE-DEBUG: forked build marker so we can confirm the patched exporter is the
+# one actually loaded inside the deployed Agent Engine container.
+print("[VAE-OTLP-METRIC] forked metric_exporter loaded (vae-metric-debug)", flush=True)
+
 
 DEFAULT_COMPRESSION = Compression.NoCompression
 DEFAULT_ENDPOINT = "http://localhost:4318/"
@@ -272,6 +276,9 @@ class OTLPMetricExporter(MetricExporter, OTLPMetricExporterMixin):
         with self._metrics.export_operation(num_items) as result:
             serialized_data = export_request.SerializeToString()
             deadline_sec = time() + self._timeout
+            # VAE-DEBUG: correlate every export attempt for the load test.
+            _vae_body = None
+            _vae_resp_headers = None
             for retry_num in range(_MAX_RETRYS):
                 # multiplying by a random number between .8 and 1.2 introduces a +/20% jitter to each backoff.
                 backoff_seconds = 2**retry_num * random.uniform(0.8, 1.2)
@@ -279,18 +286,50 @@ class OTLPMetricExporter(MetricExporter, OTLPMetricExporterMixin):
                 try:
                     resp = self._export(serialized_data, deadline_sec - time())
                     if resp.ok:
+                        print(
+                            f"[VAE-OTLP-METRIC] SUCCESS endpoint={self._endpoint} "
+                            f"num_items={num_items} attempt={retry_num} "
+                            f"status={resp.status_code}",
+                            flush=True,
+                        )
                         return MetricExportResult.SUCCESS
                 except requests.exceptions.RequestException as error:
                     reason = error
                     export_error = error
                     retryable = isinstance(error, ConnectionError)
                     status_code = None
+                    _vae_body = f"{type(error).__name__}: {error}"
+                    _vae_resp_headers = None
                 else:
                     reason = resp.reason
                     retryable = _is_retryable(resp)
                     status_code = resp.status_code
+                    try:
+                        _vae_body = resp.text[:2000]
+                    except Exception as _e:  # pylint: disable=broad-except
+                        _vae_body = f"<unreadable body: {_e}>"
+                    try:
+                        _vae_resp_headers = dict(resp.headers)
+                    except Exception:  # pylint: disable=broad-except
+                        _vae_resp_headers = None
+
+                # VAE-DEBUG: per-attempt detail (the piece the stock log omits).
+                print(
+                    f"[VAE-OTLP-METRIC] ATTEMPT endpoint={self._endpoint} "
+                    f"num_items={num_items} attempt={retry_num} "
+                    f"status={status_code} retryable={retryable} "
+                    f"reason={reason!r} body={_vae_body!r} "
+                    f"resp_headers={_vae_resp_headers!r}",
+                    flush=True,
+                )
 
                 if not retryable:
+                    print(
+                        f"[VAE-OTLP-METRIC] DROP-NONRETRYABLE "
+                        f"num_items={num_items} status={status_code} "
+                        f"reason={reason!r} body={_vae_body!r}",
+                        flush=True,
+                    )
                     _logger.error(
                         "Failed to export metrics batch code: %s, reason: %s",
                         status_code,
@@ -309,6 +348,24 @@ class OTLPMetricExporter(MetricExporter, OTLPMetricExporterMixin):
                     or backoff_seconds > (deadline_sec - time())
                     or self._shutdown
                 ):
+                    # VAE-DEBUG: disambiguate the three terminal conditions
+                    # collapsed by the stock "timeout, max retries or shutdown".
+                    _vae_cause = (
+                        "MAX_RETRIES"
+                        if retry_num + 1 == _MAX_RETRYS
+                        else "BACKOFF_EXCEEDS_DEADLINE"
+                        if backoff_seconds > (deadline_sec - time())
+                        else "SHUTDOWN"
+                    )
+                    print(
+                        f"[VAE-OTLP-METRIC] DROP-{_vae_cause} "
+                        f"num_items={num_items} attempt={retry_num} "
+                        f"status={status_code} reason={reason!r} "
+                        f"backoff={backoff_seconds:.2f}s "
+                        f"time_left={deadline_sec - time():.2f}s "
+                        f"body={_vae_body!r}",
+                        flush=True,
+                    )
                     _logger.error(
                         "Failed to export metrics batch due to timeout, "
                         "max retries or shutdown."
